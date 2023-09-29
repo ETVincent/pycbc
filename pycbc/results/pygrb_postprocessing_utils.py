@@ -27,6 +27,8 @@ import os
 import logging
 import argparse
 import copy
+
+import ligo.segments
 import numpy
 import h5py
 from scipy import stats
@@ -37,11 +39,6 @@ try:
     from ligo.lw import utils, lsctables
     from ligo.lw.table import Table
     from ligo.segments.utils import fromsegwizard
-    # Handle MultiInspiral xml-tables with glue,
-    # as ligo.lw no longer supports them
-    from glue.ligolw import lsctables as glsctables
-    # from glue.ligolw.ilwd import ilwdchar as gilwdchar
-    from glue.ligolw.ligolw import LIGOLWContentHandler
 except ImportError:
     pass
 
@@ -460,36 +457,37 @@ def sort_trigs(trial_dict, trigs, slide_dict, seg_dict):
     sorted_trigs = {}
 
     # Begin by sorting the triggers into each slide
-    # New seems pretty slow, so run it once and then use deepcopy
-    tmp_table = glsctables.New(glsctables.MultiInspiralTable)
     for slide_id in slide_dict:
-        sorted_trigs[slide_id] = copy.deepcopy(tmp_table)
-    for trig in trigs:
-        sorted_trigs[int(trig.time_slide_id)].append(trig)
+        sorted_trigs[slide_id] = []
+    for i in range(trigs['network/event_id'].len()):
+        slide_id = trigs['network/slide_id'][i]
+        sorted_trigs[slide_id].append(i)
 
     for slide_id in slide_dict:
         # These can only *reduce* the analysis time
         curr_seg_list = seg_dict[slide_id]
 
         # Check the triggers are all in the analysed segment lists
-        for trig in sorted_trigs[slide_id]:
-            if trig.end_time not in curr_seg_list:
+        for idx in sorted_trigs[slide_id]:
+            end_time = trigs['network/end_time_gc'][idx]
+            if end_time not in curr_seg_list:
                 # This can be raised if the trigger is on the segment boundary,
                 # so check if the trigger is within 1/100 of a second within
                 # the list
-                if trig.get_end() + 0.01 in curr_seg_list:
+                if end_time + 0.01 in curr_seg_list:
                     continue
-                if trig.get_end() - 0.01 in curr_seg_list:
+                if end_time - 0.01 in curr_seg_list:
                     continue
                 err_msg = "Triggers found in input files not in the list of "
                 err_msg += "analysed segments. This should not happen."
                 raise RuntimeError(err_msg)
         # END OF CHECK #
 
-        # The below line works like the inverse of .veto and only returns trigs
-        # that are within the segment specified by trial_dict[slide_id]
-        sorted_trigs[slide_id] = \
-            sorted_trigs[slide_id].vetoed(trial_dict[slide_id])
+        # Keep triggers that are in trial_dict
+
+        sorted_trigs[slide_id] = [idx for idx in sorted_trigs[slide_id]
+                                  if trigs['network/end_time_gc'][idx]
+                                  in trial_dict[slide_id]]
 
     return sorted_trigs
 
@@ -523,21 +521,21 @@ def extract_basic_trig_properties(trial_dict, trigs, slide_dict, seg_dict,
     for slide_id in slide_dict:
         slide_trigs = sorted_trigs[slide_id]
         if slide_trigs:
-            trig_time[slide_id] = numpy.asarray(slide_trigs.get_end()).\
-                                  astype(float)
-            trig_snr[slide_id] = numpy.asarray(slide_trigs.get_column('snr'))
+            trig_time[slide_id] = trigs['network/end_time_gc'][slide_trigs]
+            trig_snr[slide_id] = trigs['network/coherent_snr'][slide_trigs]
         else:
             trig_time[slide_id] = numpy.asarray([])
             trig_snr[slide_id] = numpy.asarray([])
-        trig_bestnr[slide_id] = get_bestnrs(slide_trigs,
-                                            q=chisq_index,
-                                            n=chisq_nhigh,
-                                            null_thresh=null_thresh,
-                                            snr_threshold=snr_thresh,
-                                            sngl_snr_threshold=sngl_snr_thresh,
-                                            chisq_threshold=new_snr_thresh,
-                                            null_grad_thresh=null_grad_thresh,
-                                            null_grad_val=null_grad_val)
+        # trig_bestnr[slide_id] = get_bestnrs(slide_trigs,
+        #                                     q=chisq_index,
+        #                                     n=chisq_nhigh,
+        #                                     null_thresh=null_thresh,
+        #                                     snr_threshold=snr_thresh,
+        #                                     sngl_snr_threshold=sngl_snr_thresh,
+        #                                     chisq_threshold=new_snr_thresh,
+        #                                     null_grad_thresh=null_grad_thresh,
+        #                                     null_grad_val=null_grad_val)
+        trig_bestnr[slide_id] = trigs['network/reweighted_snr'][slide_trigs]
     logging.info("Time, SNR, and BestNR of triggers extracted.")
 
     return trig_time, trig_snr, trig_bestnr
@@ -615,19 +613,18 @@ def load_injections(inj_file, vetoes, sim_table=False, label=None):
 # =============================================================================
 # Function to load timeslides
 # =============================================================================
-def load_time_slides(xml_file):
+def load_time_slides(hdf_file_path):
     """Loads timeslides from PyGRB output file as a dictionary"""
+    hdf_file = h5py.File(hdf_file_path, 'r')
+    ifos = extract_ifos(hdf_file_path)
+    ids = numpy.arange(len(hdf_file[f'{ifos[0]}/search/time_slides']))
+    time_slide_dict = {
+        slide_id: {
+            ifo: hdf_file[f'{ifo}/search/time_slides'][slide_id]
+            for ifo in ifos}
+        for slide_id in ids}
 
-    # Get all timeslides: these are number_of_ifos * number_of_timeslides
-    time_slide = load_xml_table(xml_file, glsctables.TimeSlideTable.tableName)
-    # Get a list of unique timeslide dictionaries
-    time_slide_list = [dict(i) for i in time_slide.as_dict().values()]
-    # Turn it into a dictionary indexed by the timeslide ID
-    time_slide_dict = {int(time_slide.get_time_slide_id(ov)): ov
-                       for ov in time_slide_list}
     # Check time_slide_ids are ordered correctly.
-    ids = _get_id_numbers(time_slide,
-                          "time_slide_id")[::len(time_slide_dict[0].keys())]
     if not (numpy.all(ids[1:] == numpy.array(ids[:-1])+1) and ids[0] == 0):
         err_msg = "time_slide_ids list should start at zero and increase by "
         err_msg += "one for every element"
@@ -645,29 +642,27 @@ def load_time_slides(xml_file):
 # =============================================================================
 # Function to load the segment dicitonary
 # =============================================================================
-def load_segment_dict(xml_file):
-    """Loads the segment dictionary """
+def load_segment_dict(hdf_file_path):
+    """
+    Loads the segment dictionary with the format
+    {slide_id: segmentlist(segments analyzed)}
+    """
 
-    # Get the mapping table
-    time_slide_map_table = \
-        load_xml_table(xml_file, glsctables.TimeSlideSegmentMapTable.tableName)
-    # Perhaps unnecessary as segment_def_id and time_slide_id seem to always
-    # be identical identical
-    segment_map = {
-        int(entry.segment_def_id): int(entry.time_slide_id)
-        for entry in time_slide_map_table
-    }
-    # Extract the segment table
-    segment_table = load_xml_table(
-        xml_file, glsctables.SegmentTable.tableName)
-    segment_dict = {}
-    for entry in segment_table:
-        curr_slid_id = segment_map[int(entry.segment_def_id)]
-        curr_seg = entry.get()
-        if curr_slid_id not in segment_dict:
-            segment_dict[curr_slid_id] = segments.segmentlist()
-        segment_dict[curr_slid_id].append(curr_seg)
-        segment_dict[curr_slid_id].coalesce()
+    # TODO: Long time slides will require mapping between slides and segments
+    hdf_file = h5py.File(hdf_file_path, 'r')
+    ifos = extract_ifos(hdf_file_path)
+    # Get slide IDs
+    slide_ids = numpy.arange(len(hdf_file[f'{ifos[0]}/search/time_slides']))
+    # Get segment start/end times
+    seg_starts = hdf_file['network/search/segments/start_time'][:]
+    seg_ends = hdf_file['network/search/segments/end_time'][:]
+    # Write list of segments
+    segments = ligo.segments.segmentlist()
+    for i in range(len(seg_starts)):
+        segments.append(ligo.segments.segment(seg_starts[i], seg_ends[i]))
+
+    # Write segment_dict in proper format
+    segment_dict = {slide: segments.coalesce() for slide in slide_ids}
 
     return segment_dict
 
@@ -701,7 +696,11 @@ def construct_trials(seg_files, seg_dict, ifos, slide_dict, vetoes):
         seg_buffer.coalesce()
 
         # Construct the ifo-indexed dictionary of slid veteoes
-        slid_vetoes = _slide_vetoes(vetoes, slide_dict, slide_id)
+        if vetoes is not None:
+            slid_vetoes = _slide_vetoes(vetoes, slide_dict, slide_id)
+        else:
+            slid_vetoes = {ifo: ligo.segments.segmentlist() for ifo in ifos}
+
 
         # Construct trial list and check against buffer
         trial_dict[slide_id] = segments.segmentlist()
