@@ -1,0 +1,155 @@
+#!/usr/bin/env python
+
+# Copyright (C) 2015 Andrew R. Williamson, Francesco Pannarale
+#
+# This program is free software; you can redistribute it and/or modify it
+# under the terms of the GNU General Public License as published by the
+# Free Software Foundation; either version 3 of the License, or (at your
+# option) any later version.
+#
+# This program is distributed in the hope that it will be useful, but
+# WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General
+# Public License for more details.
+#
+# You should have received a copy of the GNU General Public License along
+# with this program; if not, write to the Free Software Foundation, Inc.,
+# 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301, USA.
+
+
+# Modified to only produce segment plots! 
+
+"""
+Make workflow for the archival, targeted, coherent inspiral pipeline.
+"""
+
+import sys
+import os
+import argparse
+import logging
+import matplotlib
+matplotlib.use('agg')
+
+from igwn_segments import segment, segmentlistdict
+
+from pycbc import init_logging, add_common_pycbc_options
+from pycbc.events.veto import select_segments_by_definer
+import pycbc.workflow as _workflow
+from pycbc.workflow.core import configparser_value_to_file
+from pycbc.results.pygrb_plotting_utils import make_grb_segments_plot
+
+workflow_name = "pygrb_offline"
+
+# Parse command line options and instantiate pycbc workflow object
+parser = argparse.ArgumentParser()
+add_common_pycbc_options(parser)
+_workflow.add_workflow_command_line_group(parser)
+_workflow.add_workflow_settings_cli(parser)
+args = parser.parse_args()
+
+init_logging(args.verbose, default_level=1)
+
+wflow = _workflow.Workflow(args, workflow_name)
+all_files = _workflow.FileList([])
+tags = []
+init_dir = os.getcwd()
+
+logging.info("Generating %s workflow" % workflow_name)
+
+# Setup run directory
+if wflow.cp.has_option("workflow", "output-directory"):
+    base_dir = wflow.cp.get("workflow", "output-directory")
+else:
+    base_dir = os.getcwd()
+triggername = str(wflow.cp.get("workflow", "trigger-name"))
+run_dir = os.path.join(base_dir, "GRB%s" % triggername)
+logging.info("Workflow will be generated in %s" % run_dir)
+if not os.path.exists(run_dir):
+    os.makedirs(run_dir)
+os.chdir(run_dir)
+
+# SEGMENTS
+triggertime = int(wflow.cp.get("workflow", "trigger-time"))
+start = triggertime - int(wflow.cp.get("workflow-exttrig_segments",
+                                       "max-duration"))
+end = triggertime + int(wflow.cp.get("workflow-exttrig_segments",
+                                     "max-duration"))
+wflow.cp = _workflow.set_grb_start_end(wflow.cp, start, end)
+
+# Retrieve science segments
+curr_dir = os.getcwd()
+seg_dir = os.path.join(curr_dir, "segments")
+sciSegsFile = _workflow.get_segments_file(wflow,
+                                          'science',
+                                          'segments-science',
+                                          seg_dir)
+sciSegs = {}
+for ifo in wflow.ifos:
+    sciSegs[ifo] = sciSegsFile.segment_dict[ifo+':science']
+
+# This block of code and PyCBCMultiInspiralExecutable.get_valid_times()
+# must be consistent
+if wflow.cp.has_option("inspiral", "segment-start-pad"):
+    pad_data = int(wflow.cp.get("inspiral", "pad-data"))
+    start_pad = int(wflow.cp.get("inspiral", "segment-start-pad"))
+    end_pad = int(wflow.cp.get("inspiral", "segment-end-pad"))
+    wflow.cp.set("workflow-exttrig_segments", "min-before",
+                 str(start_pad+pad_data))
+    wflow.cp.set("workflow-exttrig_segments", "min-after",
+                 str(end_pad+pad_data))
+elif wflow.cp.has_option("inspiral", "analyse-segment-end"):
+    safety = 1
+    deadtime = int(wflow.cp.get("inspiral", "segment-length")) / 2
+    spec_len = int(wflow.cp.get("inspiral", "inverse-spec-length")) / 2
+    wflow.cp.set("workflow-exttrig_segments", "min-before",
+                 str(deadtime - spec_len - safety))
+    wflow.cp.set("workflow-exttrig_segments", "min-after",
+                 str(spec_len + safety))
+else:
+    deadtime = int(wflow.cp.get("inspiral", "segment-length")) / 4
+    wflow.cp.set("workflow-exttrig_segments", "min-before", str(deadtime))
+    wflow.cp.set("workflow-exttrig_segments", "min-after", str(deadtime))
+
+# Do checks for no/single IFO case
+single_ifo = wflow.cp.has_option("workflow", "allow-single-ifo-search")
+if len(sciSegs.keys()) == 0:
+    plot_met = make_grb_segments_plot(wflow, segmentlistdict(), triggertime,
+                                      triggername, seg_dir)
+    logging.error("No science segments available.")
+    sys.exit()
+elif len(sciSegs.keys()) < 2 and not single_ifo:
+    plot_met = make_grb_segments_plot(wflow, segmentlistdict(sciSegs),
+                                      triggertime, triggername, seg_dir)
+    msg = "Science segments exist only for %s. " % tuple(sciSegs.keys())[0]
+    msg += "If you wish to enable single IFO running add the option "
+    msg += "'allow-single-ifo-search' to the [workflow] section of your "
+    msg += "configuration file."
+    logging.error(msg)
+    sys.exit()
+else:
+    onSrc, offSrc, bufferSeg = _workflow.generate_triggered_segment(wflow,
+                                                                    seg_dir,
+                                                                    sciSegs)
+
+sciSegs = segmentlistdict(sciSegs)
+if onSrc is None:
+    plot_met = make_grb_segments_plot(
+        wflow, sciSegs, triggertime, triggername,
+        seg_dir, fail_criterion=offSrc)
+    logging.info("Making segment plot and exiting.")
+    sys.exit()
+else:
+    plot_met = make_grb_segments_plot(
+        wflow, sciSegs, triggertime, triggername, seg_dir,
+        coherent_seg=offSrc[tuple(offSrc.keys())[0]][0])
+    segs_plot = _workflow.File(plot_met[0], plot_met[1], plot_met[2],
+                               file_url=plot_met[3])
+    segs_plot.add_pfn(segs_plot.cache_entry.path, site="local")
+    sciSegs = offSrc
+    all_files.append(segs_plot)
+
+
+logging.info("Written science segments.")
+
+#exit
+sys.exit()
